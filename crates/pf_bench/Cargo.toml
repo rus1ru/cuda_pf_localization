@@ -11,5 +11,3 @@ pf_core = { path = "../pf_core", features = ["cuda"] }
 nalgebra = { workspace = true }
 rand = { workspace = true }
 
-[profile.bench]
-debug = false

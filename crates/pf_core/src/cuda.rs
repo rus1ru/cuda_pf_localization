@@ -11,7 +11,9 @@ use nalgebra::{Matrix4, Vector3};
 use crate::config::PfConfig;
 use crate::landmark_map::LandmarkMap;
 use crate::particle_filter::Backend;
-use crate::types::{quat_mean, quat_moment, Estimate, Observation, OdomDelta, Particle, Pose};
+use crate::types::{
+    quat_mean, Estimate, Observation, OdomDelta, Particle, Pose,
+};
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
@@ -24,18 +26,12 @@ struct CObservation {
     range: f32,
 }
 
+/// Output of the covariance pass: packed upper triangles
+/// [Pxx,Pxy,Pxz,Pyy,Pyz,Pzz | Axx,Axy,Axz,Ayy,Ayz,Azz].
 #[repr(C)]
-#[derive(Debug, Clone, Copy)]
-struct CEstimate {
-    x: f32,
-    y: f32,
-    z: f32,
-    qw: f32,
-    qx: f32,
-    qy: f32,
-    qz: f32,
-    ess: f32,
-    valid: c_int,
+#[derive(Debug, Clone, Copy, Default)]
+struct CCovs {
+    v: [f32; 12],
 }
 
 extern "C" {
@@ -74,8 +70,19 @@ extern "C" {
         sigma_b: f32,
         gate: f32,
     ) -> c_int;
-    fn pfc_resample(h: *mut core::ffi::c_void) -> c_int;
-    fn pfc_estimate(h: *mut core::ffi::c_void, out: *mut CEstimate) -> c_int;
+    fn pfc_resample(h: *mut core::ffi::c_void, random_inject_ratio: f32) -> c_int;
+    fn pfc_est_sums(h: *mut core::ffi::c_void, out: *mut f32) -> c_int;
+    fn pfc_covs(
+        h: *mut core::ffi::c_void,
+        mx: f32,
+        my: f32,
+        mz: f32,
+        qw: f32,
+        qx: f32,
+        qy: f32,
+        qz: f32,
+        out: *mut CCovs,
+    ) -> c_int;
     fn pfc_snapshot(
         h: *mut core::ffi::c_void,
         pos: *mut f32, // 3n
@@ -88,10 +95,16 @@ pub fn device_available() -> bool {
     unsafe { pfc_device_available() == 1 }
 }
 
+/// Observation capacity per weight() call (must match pfc_create).
+const OBS_CAP: usize = 256;
+
 pub struct CudaBackend {
     handle: *mut core::ffi::c_void,
     n: usize,
     cfg: PfConfig,
+    /// Last landmark table uploaded to the device; skips redundant PCIe
+    /// transfers when the map is unchanged between cycles.
+    lm_cache: Vec<f32>,
     /// Serialize GPU access (a filter is single-tenant, but the node may clone).
     _lock: Mutex<()>,
 }
@@ -104,7 +117,7 @@ impl CudaBackend {
         if !device_available() {
             return Err("no CUDA device".to_string());
         }
-        let handle = unsafe { pfc_create(64) };
+        let handle = unsafe { pfc_create(OBS_CAP as c_int) };
         if handle.is_null() {
             return Err("pfc_create failed".to_string());
         }
@@ -112,6 +125,7 @@ impl CudaBackend {
             handle,
             n: 0,
             cfg: PfConfig::default(),
+            lm_cache: Vec::new(),
             _lock: Mutex::new(()),
         })
     }
@@ -179,11 +193,24 @@ impl Backend for CudaBackend {
 
     fn weight(&mut self, obs: &[Observation], map: &LandmarkMap) {
         let _g = self._lock.lock().unwrap();
-        if obs.is_empty() {
-            // GPU weights stay uniform from init/resample
+        // Mirror the CPU backend: drop observations without a map entry.
+        let valid: Vec<&Observation> =
+            obs.iter().filter(|o| map.has(o.landmark_id)).collect();
+        if valid.is_empty() {
+            // nobs == 0 resets the GPU weights to uniform, matching cpu.rs.
+            unsafe {
+                pfc_weight(
+                    self.handle,
+                    std::ptr::null(),
+                    0,
+                    self.cfg.range_noise as f32,
+                    self.cfg.bearing_noise as f32,
+                    self.cfg.gate_sigma as f32,
+                );
+            }
             return;
         }
-        // upload landmark table dense to max id
+        // Upload the landmark table (dense to max id) only when it changed.
         let cap = map.capacity().max(1);
         let mut flat = vec![0.0f32; cap * 3];
         for (id, p) in map.iter() {
@@ -191,12 +218,15 @@ impl Backend for CudaBackend {
             flat[(id as usize) * 3 + 1] = p.y as f32;
             flat[(id as usize) * 3 + 2] = p.z as f32;
         }
-        unsafe {
-            pfc_upload_landmarks(self.handle, flat.as_ptr(), cap as c_int);
+        if flat != self.lm_cache {
+            unsafe {
+                pfc_upload_landmarks(self.handle, flat.as_ptr(), cap as c_int);
+            }
+            self.lm_cache = flat;
         }
-        let cobs: Vec<CObservation> = obs
+        let cobs: Vec<CObservation> = valid
             .iter()
-            .take(64)
+            .take(OBS_CAP)
             .map(|o| CObservation {
                 id: o.landmark_id,
                 mode: match o.mode {
@@ -221,41 +251,77 @@ impl Backend for CudaBackend {
         }
     }
 
-    fn resample(&mut self, _ess_ratio: f64, _random_inject_ratio: f64) {
+    fn resample(&mut self, _ess_ratio: f64, random_inject_ratio: f64) {
         unsafe {
-            pfc_resample(self.handle);
+            pfc_resample(self.handle, random_inject_ratio as f32);
         }
     }
 
     fn estimate(&self) -> Estimate {
-        let mut out = CEstimate {
-            x: 0.0,
-            y: 0.0,
-            z: 0.0,
-            qw: 1.0,
-            qx: 0.0,
-            qy: 0.0,
-            qz: 0.0,
-            ess: 0.0,
-            valid: 0,
-        };
-        unsafe {
-            pfc_estimate(self.handle, &mut out);
+        if self.n == 0 {
+            return Estimate::default();
         }
-        let mut e = Estimate {
-            mean: Pose {
-                position: Vector3::new(out.x as f64, out.y as f64, out.z as f64),
-                attitude: nalgebra::UnitQuaternion::from_quaternion(
-                    nalgebra::Quaternion::new(out.qw as f64, out.qx as f64, out.qy as f64, out.qz as f64),
-                ),
-            },
-            pos_cov: [[0.25; 3]; 3],
-            att_cov: [[0.01; 3]; 3],
-            ess: out.ess as f64,
-            valid: out.valid == 1,
+        // Pass 1: weighted sums from the device.
+        let mut sums = [0.0f32; 14];
+        unsafe {
+            let rc = pfc_est_sums(self.handle, sums.as_mut_ptr());
+            assert_eq!(rc, 0, "pfc_est_sums failed");
+        }
+
+        // Markley quaternion mean on the host — the exact same code path as
+        // the CPU backend, so both agree by construction.
+        let mut m = Matrix4::zeros();
+        for r in 0..4usize {
+            for c in r..4usize {
+                let off = 4 * r - r * (r - 1) / 2 + (c - r);
+                let v = sums[3 + off] as f64;
+                m[(r, c)] = v;
+                m[(c, r)] = v;
+            }
+        }
+        let mean_att = quat_mean(&m);
+        let q = mean_att.quaternion();
+
+        // Pass 2: covariances around the means.
+        let mut cv = CCovs::default();
+        unsafe {
+            let rc = pfc_covs(
+                self.handle,
+                sums[0],
+                sums[1],
+                sums[2],
+                q.w as f32,
+                q.i as f32,
+                q.j as f32,
+                q.k as f32,
+                &mut cv,
+            );
+            assert_eq!(rc, 0, "pfc_covs failed");
+        }
+        // unpack a symmetric 3x3 from a packed upper triangle at offset o
+        let sym3 = |v: &[f32; 12], o: usize| -> [[f64; 3]; 3] {
+            let mut m = [[0.0f64; 3]; 3];
+            let at = |r: usize, c: usize| o + 3 * r - r * (r - 1) / 2 + (c - r);
+            for r in 0..3usize {
+                for c in r..3usize {
+                    let x = v[at(r, c)] as f64;
+                    m[r][c] = x;
+                    m[c][r] = x;
+                }
+            }
+            m
         };
-        e.mean.attitude.renormalize();
-        e
+
+        Estimate {
+            mean: Pose {
+                position: Vector3::new(sums[0] as f64, sums[1] as f64, sums[2] as f64),
+                attitude: mean_att,
+            },
+            pos_cov: sym3(&cv.v, 0),
+            att_cov: sym3(&cv.v, 6),
+            ess: if sums[13] > 0.0 { 1.0 / sums[13] as f64 } else { 0.0 },
+            valid: true,
+        }
     }
 
     fn snapshot(&self) -> Vec<Particle> {
@@ -287,8 +353,3 @@ impl Backend for CudaBackend {
     }
 }
 
-// keep quat helpers referenced (used by the CPU path and future GPU covariance)
-#[allow(dead_code)]
-fn _unused(m: &Matrix4<f64>) -> nalgebra::UnitQuaternion<f64> {
-    quat_mean(m)
-}

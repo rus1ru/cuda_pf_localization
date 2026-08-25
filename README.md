@@ -12,10 +12,10 @@ estimate:
 
 | N particles | CPU (rayon) ms/cycle | CUDA ms/cycle | speedup |
 |---|---|---|---|
-| 1k | 0.152 | 0.252 | 0.6x (launch overhead dominates) |
-| 10k | 1.135 | 0.252 | **4.5x** |
-| 100k | 8.386 | 0.428 | **19.6x** |
-| 500k | 41.771 | 1.459 | **28.6x** |
+| 1k | 0.193 | 0.240 | 0.8x (launch overhead dominates) |
+| 10k | 1.254 | 0.250 | **5.0x** |
+| 100k | 10.042 | 0.483 | **20.8x** |
+| 500k | 45.767 | 1.740 | **26.3x** |
 
 Both backends localize to centimeter-level mean tracking error on the test
 trajectory (see `tests/integration.rs`). Crossover at ~4k particles: use
@@ -29,8 +29,11 @@ src/cuda/pf_kernels.cu   THE CUDA implementation of every pfc_* FFI symbol:
                          k_seed_rng / k_reinit / k_predict / k_weight,
                          softmax via ordered-float atomicMax + atomicAdd,
                          CUB inclusive scan + parallel binary-search gather
-                         for systematic resampling, block-reduced weighted
-                         sums, power-iteration Markley quaternion mean.
+                         for systematic resampling (+ uniform re-injection),
+                         block-reduced weighted sums and covariances.
+                         The Markley quaternion mean is solved on the host
+                         with the same nalgebra code path as the CPU backend,
+                         so both backends agree by construction.
 crates/pf_core           Rust engine: Backend trait, cpu.rs (rayon),
                          cuda.rs = pure FFI binding to libpf_kernels.so.
 crates/pf_bench          the benchmark binary (this table)
@@ -48,7 +51,9 @@ Requires nvcc (CUDA >= 12 tested) and CMake >= 3.18.
 
 ```
 ./run_bench.sh                                  # full build + benchmark
-LD_LIBRARY_PATH=build cargo test --release -p pf_core   # 7 tests
+LD_LIBRARY_PATH=build cargo test --release -p pf_core --features cuda
+                                                        # CPU suite + GPU agreement tests
+cargo test --release -p pf_core                          # CPU-only (no GPU needed)
 LD_LIBRARY_PATH=build ./target/release/pf-bench --csv   # machine-readable
 ```
 
@@ -78,13 +83,23 @@ Combined stack: this GL stage bootstraps the particle filter for tracking -
 global localize once from a single scan, then hand the pose to the filter.
 Both stages GPU-accelerated, both in Rust.
 
-## Notes / known gaps
+## Production notes
+
+- Both backends now return full weighted position and attitude-tangent
+  covariances from `estimate()`; a test asserts CPU/GPU agreement against an
+  analytic Gaussian prior (`tests/cuda_agreement.rs`).
+- `random_inject_ratio` is implemented on both backends (GPU: `k_inject`,
+  deterministic in the resample stream).
+- Empty observation sets and observations without a map entry reset weights
+  to uniform on both backends (previously the GPU kept stale weights).
+- The landmark table is uploaded to the device only when it changes.
+
+## Known gaps
 
 - GPU math is f32 (CPU f64): expect ~1e-3 relative agreement, not bitwise.
 - RNG streams differ by design (curand Philox vs splitmix64) — same noise
   statistics, different draws.
-- estimate() returns placeholder covariances on the CUDA path; position
-  mean, quaternion mean, and ESS are exact.
-- random_inject_ratio is ignored by the CUDA backend.
-- pf_node (rclrs ROS wrapper) is scaffolded but needs a ROS 2 environment;
-  not part of the workspace build yet.
+- At most 256 observations per `weight()` call are used (silently truncated);
+  raise `OBS_CAP` in `pf_core/src/cuda.rs` if your sensor produces more.
+- A ROS 2 wrapper node (rclrs) is planned but not started; the core crate is
+  ROS-independent by design.

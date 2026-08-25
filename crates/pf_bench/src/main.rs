@@ -55,7 +55,6 @@ struct Scenario {
     map: LandmarkMap,
     prior: Pose,
     steps: Vec<(OdomDelta, Vec<Observation>)>,
-    truth_err_last: f64,
 }
 
 fn build_scenario(steps_n: usize, seed: u64) -> Scenario {
@@ -107,7 +106,7 @@ fn build_scenario(steps_n: usize, seed: u64) -> Scenario {
         }
         steps.push((odo, obs));
     }
-    Scenario { map, prior, steps, truth_err_last: 0.0 }
+    Scenario { map, prior, steps }
 }
 
 fn run_backend(kind: BackendKind, n: usize, steps_n: usize, seed: u64) -> (String, f64, f64, usize) {

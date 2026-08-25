@@ -15,6 +15,9 @@ use crate::types::{
     quat_mean, quat_moment, Estimate, Observation, OdomDelta, Particle, Pose,
 };
 
+/// (particle index, new position + attitude) produced by a parallel pass.
+type PoseUpdate = (usize, (Vector3<f64>, UnitQuaternion<f64>));
+
 /// CPU particle set with SoA layout for cache-friendly parallel passes.
 pub struct CpuBackend {
     pub(crate) n: usize,
@@ -28,6 +31,12 @@ pub struct CpuBackend {
     /// Per-particle RNG seeds (splitmix streams, deterministic).
     seeds: Vec<u64>,
     global_seed: u64,
+}
+
+impl Default for CpuBackend {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl CpuBackend {
@@ -75,7 +84,7 @@ impl Backend for CpuBackend {
 
     fn reinit(&mut self, pose: &Pose, pos_std: &Vector3<f64>, rot_std: &Vector3<f64>) {
         self.global_seed = self.global_seed.wrapping_add(0x9E37_7979_7979_7979);
-        let pairs: Vec<(usize, (Vector3<f64>, UnitQuaternion<f64>))> = (0..self.n)
+        let pairs: Vec<PoseUpdate> = (0..self.n)
             .into_par_iter()
             .map(|i| {
                 let mut rng = self.rng_for(i);
@@ -120,7 +129,7 @@ impl Backend for CpuBackend {
 
     fn predict(&mut self, odom: &OdomDelta) {
         self.global_seed = self.global_seed.wrapping_add(0x9E37_7979_7979_7979);
-        let updates: Vec<(usize, (Vector3<f64>, UnitQuaternion<f64>))> = (0..self.n)
+        let updates: Vec<PoseUpdate> = (0..self.n)
             .into_par_iter()
             .map(|i| {
                 let mut rng = self.rng_for(i);
@@ -235,8 +244,8 @@ impl Backend for CpuBackend {
             let w = 1.0 / self.n as f64;
             self.weight.iter_mut().for_each(|x| *x = w);
         } else {
-            for i in 0..self.n {
-                self.weight[i] = (lls[i] - max_ll).exp() / sum;
+            for (w, &ll) in self.weight.iter_mut().zip(lls.iter()) {
+                *w = (ll - max_ll).exp() / sum;
             }
         }
     }

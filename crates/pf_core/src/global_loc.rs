@@ -171,7 +171,7 @@ impl OccGrid {
         } else {
             f64::INFINITY
         };
-        let mut dist = 0.0f64;
+        let mut dist;
         for _ in 0..8192 {
             if tmx <= tmy {
                 dist = tmx;
@@ -277,8 +277,6 @@ pub struct CudaGlobalLoc {
     pub grid_w: usize,
     pub grid_h: usize,
     pub params: GlParams,
-    last_scores: Option<Vec<f32>>,
-    nh_last: usize,
 }
 
 #[cfg(feature = "cuda")]
@@ -301,8 +299,7 @@ impl CudaGlobalLoc {
         if handle.is_null() {
             return Err("pfgl_create failed".into());
         }
-        Ok(Self { handle, grid_w: grid.w, grid_h: grid.h, params,
-                  last_scores: None, nh_last: 0 })
+        Ok(Self { handle, grid_w: grid.w, grid_h: grid.h, params })
     }
 
     /// Localize: returns the bottom-k hypotheses by CAER, ascending.
@@ -321,10 +318,9 @@ impl CudaGlobalLoc {
             if k <= 0 {
                 return Err("pfgl_topk failed".into());
             }
-            self.nh_last = p.hypotheses;
             // re-score winners on host to recover their CAER values cheaply
             // (avoids a second device readback path; k is tiny)
-            Ok(out.chunks_exact(3).map(|c| PoseHypothesis {
+            Ok(out.chunks(3).map(|c| PoseHypothesis {
                 x: c[0] as f64, y: c[1] as f64, theta: c[2] as f64, caer: f64::NAN,
             }).collect())
         }

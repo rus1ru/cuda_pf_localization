@@ -60,6 +60,11 @@ jobs:
           export LD_LIBRARY_PATH="$PWD/build:$LD_LIBRARY_PATH"
           cargo build --release -p pf-bench
 
+      - name: Tests (CUDA feature set; GPU tests self-skip without a device)
+        run: |
+          export LD_LIBRARY_PATH="$PWD/build:$LD_LIBRARY_PATH"
+          cargo test --release -p pf_core --features cuda
+
       - name: Smoke-run (1k particles, GPU)
         run: |
           export LD_LIBRARY_PATH="$PWD/build:$LD_LIBRARY_PATH"
