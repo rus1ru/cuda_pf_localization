@@ -55,6 +55,29 @@ LD_LIBRARY_PATH=build ./target/release/pf-bench --csv   # machine-readable
 The `cuda` cargo feature on pf_core links against build/libpf_kernels.so
 (see crates/pf_core/build.rs).
 
+## GPU Global Localization (CBGL port)
+
+Stage-1 port of CBGL (Filotheou, arXiv:2307.14247): disperse pose
+hypotheses over an occupancy grid, DDA-raycast virtual map-scans, score
+CAER = sum |real - virtual| per ray, keep bottom-k via CUB radix sort.
+All stages on device; Rust binding in `pf_core::global_loc` with a rayon
+CPU twin as oracle/fallback. Includes a ROS `map_server` PGM/YAML loader.
+
+Measured on RTX 4050 Mobile vs i7-13700H (12-thread rayon), 10x10 m grid,
+360-ray scan, single-shot pose recovery within 0.5 m:
+
+| hypotheses | CPU ms | CUDA ms | speedup | CUDA success |
+|---|---|---|---|---|
+| 5k | 52 | **1.2** | 43x | 17/20 |
+| 50k | 545 | **13.1** | 42x | 20/20 |
+| 200k | 2380 | **48.6** | 49x | 20/20 |
+
+Run: `LD_LIBRARY_PATH=build ./target/release/pf-bench --gl`
+
+Combined stack: this GL stage bootstraps the particle filter for tracking -
+global localize once from a single scan, then hand the pose to the filter.
+Both stages GPU-accelerated, both in Rust.
+
 ## Notes / known gaps
 
 - GPU math is f32 (CPU f64): expect ~1e-3 relative agreement, not bitwise.

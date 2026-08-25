@@ -160,6 +160,34 @@ fn run_backend(kind: BackendKind, n: usize, steps_n: usize, seed: u64) -> (Strin
     )
 }
 
+
+fn gl_test_grid() -> pf_core::global_loc::OccGrid {
+    let (w, h) = (200usize, 200usize);
+    let mut cells = vec![0u8; w * h];
+    for x in 0..w {
+        cells[x] = 1;
+        cells[(h - 1) * w + x] = 1;
+    }
+    for y in 0..h {
+        cells[y * w] = 1;
+        cells[y * w + w - 1] = 1;
+    }
+    let xr = ((4.0 - 0.25) / 0.05) as usize..=((4.0 + 0.25) / 0.05) as usize;
+    let yr = ((5.0 - 0.25) / 0.05) as usize..=((5.0 + 0.25) / 0.05) as usize;
+    for y in yr {
+        for x in xr.clone() {
+            cells[y * w + x] = 1;
+        }
+    }
+    pf_core::global_loc::OccGrid {
+        w,
+        h,
+        res: 0.05,
+        origin: nalgebra::Vector2::new(0.0, 0.0),
+        cells,
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let csv = args.iter().any(|a| a == "--csv");
@@ -193,4 +221,87 @@ fn main() {
             }
         }
     }
+
+    // ---- GPU global localization benchmark (--gl) ----
+    if args.iter().any(|a| a == "--gl") {
+        println!("\n== Global localization (CBGL-style, 10x10 m grid @0.05 m) ==");
+        println!(
+            "{:>10} {:<8} {:>12} {:>12} {:>10}",
+            "hyps", "backend", "ms/localize", "pos err m", "success"
+        );
+        let grid = gl_test_grid();
+        // truth scan
+        let truth = (6.0f64, 7.0f64, 0.8f64);
+        let scan64 =
+            grid.map_scan(truth.0, truth.1, truth.2, 360, std::f64::consts::TAU, 10.0);
+        let scan32: Vec<f32> = scan64.iter().map(|v| *v as f32).collect();
+
+        for &nh in &[5_000usize, 50_000, 200_000] {
+            let params = pf_core::global_loc::GlParams {
+                hypotheses: nh,
+                ..Default::default()
+            };
+            // CPU timing
+            let cpu = pf_core::global_loc::CpuGlobalLoc::new(grid.clone(), params.clone());
+            let t0 = Instant::now();
+            let runs = 3;
+            let mut ok = 0;
+            for _ in 0..runs {
+                let top = cpu.localize(&scan64);
+                let b = &top[0];
+                if ((b.x - truth.0).powi(2) + (b.y - truth.1).powi(2)).sqrt() < 0.5 {
+                    ok += 1;
+                }
+            }
+            let cpu_ms = t0.elapsed().as_secs_f64() * 1000.0 / runs as f64;
+            let cpu_top = cpu.localize(&scan64);
+            let b = &cpu_top[0];
+            let err = ((b.x - truth.0).powi(2) + (b.y - truth.1).powi(2)).sqrt();
+            println!("{nh:>10} {:<8} {cpu_ms:>12.1} {err:>12.3} {:>9}/3", "cpu", ok);
+
+            // CUDA timing
+            if pf_core::cuda::device_available() {
+                if let Ok(mut gpu) =
+                    pf_core::global_loc::CudaGlobalLoc::new(&grid, params.clone())
+                {
+                    let _ = gpu.localize(&scan32); // warmup
+                    let t0 = Instant::now();
+                    let mut gok = 0;
+                    let gruns = 20;
+                    for i in 0..gruns {
+                        gpu.params.seed = 100 + i as u64;
+                        let top = match gpu.localize(&scan32) {
+                            Ok(t) => t,
+                            Err(_) => break,
+                        };
+                        if let Some(b) = top.first() {
+                            if ((b.x - truth.0).powi(2)
+                                + (b.y - truth.1).powi(2))
+                                .sqrt()
+                                < 0.5
+                            {
+                                gok += 1;
+                            }
+                        }
+                    }
+                    let gpu_ms =
+                        t0.elapsed().as_secs_f64() * 1000.0 / gruns as f64;
+                    let gpu_top = gpu.localize(&scan32).unwrap_or_default();
+                    let gerr = gpu_top
+                        .first()
+                        .map(|b| {
+                            ((b.x - truth.0).powi(2)
+                                + (b.y - truth.1).powi(2))
+                                .sqrt()
+                        })
+                        .unwrap_or(f64::NAN);
+                    println!(
+                        "{nh:>10} {:<8} {gpu_ms:>12.1} {gerr:>12.3} {gok:>8}/{gruns}",
+                        "cuda"
+                    );
+                }
+            }
+        }
+    }
+
 }
