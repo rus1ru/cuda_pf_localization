@@ -1,0 +1,25 @@
+# pf_node defaults
+pf_node:
+  ros__parameters:
+    pf:
+      backend: "auto"            # auto | cuda | cpu
+      particle_count: 4096
+      trans_noise_x: 0.05        # m per update
+      trans_noise_y: 0.05
+      trans_noise_z: 0.02
+      rot_noise_roll: 0.02       # rad per update
+      rot_noise_pitch: 0.02
+      rot_noise_yaw: 0.03
+      range_noise: 0.05          # m
+      bearing_noise: 0.02        # rad
+      resample: "systematic"     # systematic | none
+      resample_ess_ratio: 0.5
+      random_inject_ratio: 0.0
+      gate_sigma: 0.0            # 0 disables gating
+      seed: 42
+    obs_mode: "cartesian"        # cartesian | range_bearing
+    map_file: ""                 # YAML: "id: [x, y, z]" per line
+    map_frame: "map"
+    base_frame: "base_link"
+    publish_particles: true
+    broadcast_tf: true

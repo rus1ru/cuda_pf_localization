@@ -1,0 +1,21 @@
+[package]
+name = "pf_core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "3D Monte Carlo localization from point landmarks: core engine (CPU + CUDA FFI)"
+
+[dependencies]
+nalgebra = { workspace = true }
+rand = { workspace = true, features = ["small_rng"] }
+rand_distr = { workspace = true }
+rayon = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+approx = "0.5"
+
+[features]
+default = []
+cuda = []

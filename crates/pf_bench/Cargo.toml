@@ -1,0 +1,15 @@
+[package]
+name = "pf-bench"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "CPU vs CUDA particle-filter benchmark"
+
+[dependencies]
+pf_core = { path = "../pf_core", features = ["cuda"] }
+nalgebra = { workspace = true }
+rand = { workspace = true }
+
+[profile.bench]
+debug = false

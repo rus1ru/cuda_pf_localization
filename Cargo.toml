@@ -1,0 +1,16 @@
+[workspace]
+resolver = "2"
+members = ["crates/pf_core", "crates/pf_bench"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["Rusiru Anupama Rasanjana <rusiru@example.com>"]
+
+[workspace.dependencies]
+nalgebra = "0.33"
+rand = "0.8"
+rand_distr = "0.4"
+rayon = "1.10"
+thiserror = "1"
