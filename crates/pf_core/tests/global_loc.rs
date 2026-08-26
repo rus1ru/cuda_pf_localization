@@ -1,35 +1,11 @@
+
 //! Global localization tests: DDA raycast correctness + CPU/GPU agreement.
 
 use pf_core::global_loc::{CpuGlobalLoc, GlParams, OccGrid};
 
-/// 10x10 m room at 0.05 m/cell = 200x200 cells, walls on the border
-/// plus one interior pillar.
+/// The shared 10x10 m room fixture.
 fn test_grid() -> OccGrid {
-    let (w, h) = (200usize, 200usize);
-    let mut cells = vec![0u8; w * h];
-    for x in 0..w {
-        cells[x] = 1; // bottom wall (y=0)
-        cells[(h - 1) * w + x] = 1; // top wall
-    }
-    for y in 0..h {
-        cells[y * w] = 1;
-        cells[y * w + w - 1] = 1;
-    }
-    // pillar centered at world (4,5): x in [3.75,4.30], y in [4.75,5.30]
-    let xr = ((4.0 - 0.25) / 0.05) as usize..=((4.0 + 0.25) / 0.05) as usize;
-    let yr = ((5.0 - 0.25) / 0.05) as usize..=((5.0 + 0.25) / 0.05) as usize;
-    for y in yr {
-        for x in xr.clone() {
-            cells[y * w + x] = 1;
-        }
-    }
-    OccGrid {
-        w,
-        h,
-        res: 0.05,
-        origin: nalgebra::Vector2::new(0.0, 0.0),
-        cells,
-    }
+    pf_core::sim::room_grid()
 }
 
 #[test]

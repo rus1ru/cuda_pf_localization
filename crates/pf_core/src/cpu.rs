@@ -18,6 +18,85 @@ use crate::types::{
 /// (particle index, new position + attitude) produced by a parallel pass.
 type PoseUpdate = (usize, (Vector3<f64>, UnitQuaternion<f64>));
 
+/// Three independent standard-normal draws.
+#[inline]
+fn gauss3(rng: &mut SmallRng) -> [f64; 3] {
+    [
+        StandardNormal.sample(rng),
+        StandardNormal.sample(rng),
+        StandardNormal.sample(rng),
+    ]
+}
+
+/// Rotation-noise delta quaternion from an axis-angle draw.
+#[inline]
+fn noise_dq(rot_std: &Vector3<f64>, rng: &mut SmallRng) -> UnitQuaternion<f64> {
+    let w3 = gauss3(rng);
+    let axis_ang = Vector3::new(rot_std[0] * w3[0], rot_std[1] * w3[1], rot_std[2] * w3[2]);
+    let angle = axis_ang.norm();
+    if angle > 1e-12 {
+        let ax = Unit::new_normalize(axis_ang);
+        UnitQuaternion::from_axis_angle(&ax, angle)
+    } else {
+        UnitQuaternion::identity()
+    }
+}
+
+/// Gated measurement log-likelihood model (Cartesian + range-bearing).
+struct MeasModel {
+    inv2rr: f64,
+    inv2bb: f64,
+    gate: f64,
+    cart_gate2: f64,
+    rng_gate2: f64,
+    brg_gate2: f64,
+}
+
+impl MeasModel {
+    fn new(range_noise: f64, bearing_noise: f64, gate: f64) -> Self {
+        let sr = range_noise.max(1e-6);
+        let sb = bearing_noise.max(1e-6);
+        let g2 = gate * gate;
+        Self {
+            inv2rr: 1.0 / (2.0 * sr * sr),
+            inv2bb: 1.0 / (2.0 * sb * sb),
+            gate,
+            cart_gate2: g2 * 3.0 * sr * sr,
+            rng_gate2: g2 * sr * sr,
+            brg_gate2: g2 * sb * sb,
+        }
+    }
+
+    fn cart_ll(&self, pred: &Vector3<f64>, expected: &Vector3<f64>) -> f64 {
+        let e = pred - expected;
+        let r2 = e.norm_squared();
+        if self.gate > 0.0 && r2 > self.cart_gate2 {
+            -0.5 * self.gate * self.gate * 3.0
+        } else {
+            -r2 * self.inv2rr
+        }
+    }
+
+    fn rb_ll(&self, pred: &Vector3<f64>, o: &Observation) -> f64 {
+        let rn = pred.norm().max(1e-9);
+        let er = rn - o.range;
+        let dir_pred = pred / rn;
+        let dot = (-dir_pred).dot(&o.vector).clamp(-1.0, 1.0);
+        let eb = dot.acos();
+        let range_ll = if self.gate > 0.0 && er * er > self.rng_gate2 {
+            -0.5 * self.gate * self.gate
+        } else {
+            -er * er * self.inv2rr
+        };
+        let bearing_ll = if self.gate > 0.0 && eb * eb > self.brg_gate2 {
+            -0.5 * self.gate * self.gate
+        } else {
+            -eb * eb * self.inv2bb
+        };
+        range_ll + bearing_ll
+    }
+}
+
 /// CPU particle set with SoA layout for cache-friendly parallel passes.
 pub struct CpuBackend {
     pub(crate) n: usize,
@@ -53,6 +132,23 @@ impl CpuBackend {
         }
     }
 
+    /// Advance the per-generation seed stream (reinit / predict).
+    fn bump_generation(&mut self) {
+        self.global_seed = self.global_seed.wrapping_add(0x9E37_7979_7979_7979);
+    }
+
+    fn apply_poses(&mut self, updates: Vec<PoseUpdate>) {
+        for (i, (p, a)) in updates {
+            self.pos[i] = p;
+            self.att[i] = a;
+        }
+    }
+
+    fn set_uniform_weights(&mut self) {
+        let w = 1.0 / self.n as f64;
+        self.weight.iter_mut().for_each(|x| *x = w);
+    }
+
     fn rng_for(&self, i: usize) -> SmallRng {
         // splitmix64 of (global_seed, particle index, generation)
         let mut z = self
@@ -83,66 +179,29 @@ impl Backend for CpuBackend {
     }
 
     fn reinit(&mut self, pose: &Pose, pos_std: &Vector3<f64>, rot_std: &Vector3<f64>) {
-        self.global_seed = self.global_seed.wrapping_add(0x9E37_7979_7979_7979);
+        self.bump_generation();
         let pairs: Vec<PoseUpdate> = (0..self.n)
             .into_par_iter()
             .map(|i| {
                 let mut rng = self.rng_for(i);
-                let n3: [f64; 3] = [
-                    StandardNormal.sample(&mut rng),
-                    StandardNormal.sample(&mut rng),
-                    StandardNormal.sample(&mut rng),
-                ];
+                let n3 = gauss3(&mut rng);
                 let p = pose.position
-                    + Vector3::new(
-                        pos_std[0] * n3[0],
-                        pos_std[1] * n3[1],
-                        pos_std[2] * n3[2],
-                    );
-                let w3: [f64; 3] = [
-                    StandardNormal.sample(&mut rng),
-                    StandardNormal.sample(&mut rng),
-                    StandardNormal.sample(&mut rng),
-                ];
-                let axis_ang = Vector3::new(
-                    rot_std[0] * w3[0],
-                    rot_std[1] * w3[1],
-                    rot_std[2] * w3[2],
-                );
-                let angle = axis_ang.norm();
-                let dq = if angle > 1e-12 {
-                    let ax = Unit::new_normalize(axis_ang);
-                    UnitQuaternion::from_axis_angle(&ax, angle)
-                } else {
-                    UnitQuaternion::identity()
-                };
-                let a = pose.attitude * dq;
-                (i, (p, a))
+                    + Vector3::new(pos_std[0] * n3[0], pos_std[1] * n3[1], pos_std[2] * n3[2]);
+                let dq = noise_dq(rot_std, &mut rng);
+                (i, (p, pose.attitude * dq))
             })
             .collect();
-        for (i, (p, a)) in pairs {
-            self.pos[i] = p;
-            self.att[i] = a;
-            self.weight[i] = 1.0 / self.n as f64;
-        }
+        self.apply_poses(pairs);
+        self.set_uniform_weights();
     }
 
     fn predict(&mut self, odom: &OdomDelta) {
-        self.global_seed = self.global_seed.wrapping_add(0x9E37_7979_7979_7979);
+        self.bump_generation();
         let updates: Vec<PoseUpdate> = (0..self.n)
             .into_par_iter()
             .map(|i| {
                 let mut rng = self.rng_for(i);
-                let n3: [f64; 3] = [
-                    StandardNormal.sample(&mut rng),
-                    StandardNormal.sample(&mut rng),
-                    StandardNormal.sample(&mut rng),
-                ];
-                let w3: [f64; 3] = [
-                    StandardNormal.sample(&mut rng),
-                    StandardNormal.sample(&mut rng),
-                    StandardNormal.sample(&mut rng),
-                ];
+                let n3 = gauss3(&mut rng);
                 let body_disp = odom.translation
                     + Vector3::new(
                         odom.trans_noise[0] * n3[0],
@@ -152,49 +211,25 @@ impl Backend for CpuBackend {
                 let world_disp = self.att[i].transform_vector(&body_disp);
                 let p = self.pos[i] + world_disp;
 
-                let axis_ang = Vector3::new(
-                    odom.rot_noise[0] * w3[0],
-                    odom.rot_noise[1] * w3[1],
-                    odom.rot_noise[2] * w3[2],
-                );
-                let angle = axis_ang.norm();
-                let dq = if angle > 1e-12 {
-                    let ax = Unit::new_normalize(axis_ang);
-                    UnitQuaternion::from_axis_angle(&ax, angle)
-                } else {
-                    UnitQuaternion::identity()
-                };
-                let a = self.att[i] * odom.rotation * dq;
-                (i, (p, a))
+                let dq = noise_dq(&odom.rot_noise, &mut rng);
+                (i, (p, self.att[i] * odom.rotation * dq))
             })
             .collect();
-        for (i, (p, a)) in updates {
-            self.pos[i] = p;
-            self.att[i] = a;
-        }
+        self.apply_poses(updates);
     }
 
     fn weight(&mut self, obs: &[Observation], map: &LandmarkMap) {
         if obs.is_empty() {
-            let w = 1.0 / self.n as f64;
-            self.weight.iter_mut().for_each(|x| *x = w);
+            self.set_uniform_weights();
             return;
         }
         let valid: Vec<&Observation> =
             obs.iter().filter(|o| map.has(o.landmark_id)).collect();
         if valid.is_empty() {
-            let w = 1.0 / self.n as f64;
-            self.weight.iter_mut().for_each(|x| *x = w);
+            self.set_uniform_weights();
             return;
         }
-        let sr = self.cfg.range_noise.max(1e-6);
-        let sb = self.cfg.bearing_noise.max(1e-6);
-        let inv2rr = 1.0 / (2.0 * sr * sr);
-        let inv2bb = 1.0 / (2.0 * sb * sb);
-        let gate = self.cfg.gate_sigma;
-        let cart_gate2 = gate * gate * 3.0 * sr * sr;
-        let rng_gate2 = gate * gate * sr * sr;
-        let brg_gate2 = gate * gate * sb * sb;
+        let mm = MeasModel::new(self.cfg.range_noise, self.cfg.bearing_noise, self.cfg.gate_sigma);
 
         // parallel log-likelihoods
         let lls: Vec<f64> = (0..self.n)
@@ -204,34 +239,10 @@ impl Backend for CpuBackend {
                 for o in &valid {
                     let lm = map.at(o.landmark_id);
                     let pred = self.att[i].inverse_transform_vector(&(lm - self.pos[i]));
-                    match o.mode {
-                        crate::types::ObsMode::Cartesian => {
-                            let e = pred - o.vector;
-                            let r2 = e.norm_squared();
-                            ll += if gate > 0.0 && r2 > cart_gate2 {
-                                -0.5 * gate * gate * 3.0
-                            } else {
-                                -r2 * inv2rr
-                            };
-                        }
-                        crate::types::ObsMode::RangeBearing => {
-                            let rn = pred.norm().max(1e-9);
-                            let er = rn - o.range;
-                            let dir_pred = pred / rn;
-                            let dot = (-dir_pred).dot(&o.vector).clamp(-1.0, 1.0);
-                            let eb = dot.acos();
-                            ll += if gate > 0.0 && er * er > rng_gate2 {
-                                -0.5 * gate * gate
-                            } else {
-                                -er * er * inv2rr
-                            };
-                            ll += if gate > 0.0 && eb * eb > brg_gate2 {
-                                -0.5 * gate * gate
-                            } else {
-                                -eb * eb * inv2bb
-                            };
-                        }
-                    }
+                    ll += match o.mode {
+                        crate::types::ObsMode::Cartesian => mm.cart_ll(&pred, &o.vector),
+                        crate::types::ObsMode::RangeBearing => mm.rb_ll(&pred, o),
+                    };
                 }
                 ll
             })
@@ -241,8 +252,7 @@ impl Backend for CpuBackend {
         let max_ll = lls.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
         let sum: f64 = lls.iter().map(|&l| (l - max_ll).exp()).sum();
         if sum <= 0.0 || !sum.is_finite() {
-            let w = 1.0 / self.n as f64;
-            self.weight.iter_mut().for_each(|x| *x = w);
+            self.set_uniform_weights();
         } else {
             for (w, &ll) in self.weight.iter_mut().zip(lls.iter()) {
                 *w = (ll - max_ll).exp() / sum;
@@ -293,8 +303,7 @@ impl Backend for CpuBackend {
         }
         self.pos = out_pos;
         self.att = out_att;
-        let w = 1.0 / self.n as f64;
-        self.weight.iter_mut().for_each(|x| *x = w);
+        self.set_uniform_weights();
     }
 
     fn estimate(&self) -> Estimate {

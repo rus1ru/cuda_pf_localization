@@ -139,6 +139,43 @@ impl Drop for CudaBackend {
     }
 }
 
+/// Upload the landmark table (dense to max id) only when it changed.
+/// Free function so it can be called while the device mutex guard lives.
+fn sync_landmarks(handle: *mut core::ffi::c_void, cache: &mut Vec<f32>, map: &LandmarkMap) {
+    let cap = map.capacity().max(1);
+    let mut flat = vec![0.0f32; cap * 3];
+    for (id, p) in map.iter() {
+        flat[(id as usize) * 3] = p.x as f32;
+        flat[(id as usize) * 3 + 1] = p.y as f32;
+        flat[(id as usize) * 3 + 2] = p.z as f32;
+    }
+    if flat != *cache {
+        unsafe {
+            pfc_upload_landmarks(handle, flat.as_ptr(), cap as c_int);
+        }
+        *cache = flat;
+    }
+}
+
+impl CudaBackend {
+    fn to_cobs(obs: &[&Observation]) -> Vec<CObservation> {
+        obs.iter()
+            .take(OBS_CAP)
+            .map(|o| CObservation {
+                id: o.landmark_id,
+                mode: match o.mode {
+                    crate::types::ObsMode::Cartesian => 0,
+                    crate::types::ObsMode::RangeBearing => 1,
+                },
+                dx: o.vector.x as f32,
+                dy: o.vector.y as f32,
+                dz: o.vector.z as f32,
+                range: o.range as f32,
+            })
+            .collect()
+    }
+}
+
 impl Backend for CudaBackend {
     fn name(&self) -> &'static str {
         "cuda"
@@ -196,57 +233,28 @@ impl Backend for CudaBackend {
         // Mirror the CPU backend: drop observations without a map entry.
         let valid: Vec<&Observation> =
             obs.iter().filter(|o| map.has(o.landmark_id)).collect();
+        let noise = (
+            self.cfg.range_noise as f32,
+            self.cfg.bearing_noise as f32,
+            self.cfg.gate_sigma as f32,
+        );
         if valid.is_empty() {
             // nobs == 0 resets the GPU weights to uniform, matching cpu.rs.
             unsafe {
-                pfc_weight(
-                    self.handle,
-                    std::ptr::null(),
-                    0,
-                    self.cfg.range_noise as f32,
-                    self.cfg.bearing_noise as f32,
-                    self.cfg.gate_sigma as f32,
-                );
+                pfc_weight(self.handle, std::ptr::null(), 0, noise.0, noise.1, noise.2);
             }
             return;
         }
-        // Upload the landmark table (dense to max id) only when it changed.
-        let cap = map.capacity().max(1);
-        let mut flat = vec![0.0f32; cap * 3];
-        for (id, p) in map.iter() {
-            flat[(id as usize) * 3] = p.x as f32;
-            flat[(id as usize) * 3 + 1] = p.y as f32;
-            flat[(id as usize) * 3 + 2] = p.z as f32;
-        }
-        if flat != self.lm_cache {
-            unsafe {
-                pfc_upload_landmarks(self.handle, flat.as_ptr(), cap as c_int);
-            }
-            self.lm_cache = flat;
-        }
-        let cobs: Vec<CObservation> = valid
-            .iter()
-            .take(OBS_CAP)
-            .map(|o| CObservation {
-                id: o.landmark_id,
-                mode: match o.mode {
-                    crate::types::ObsMode::Cartesian => 0,
-                    crate::types::ObsMode::RangeBearing => 1,
-                },
-                dx: o.vector.x as f32,
-                dy: o.vector.y as f32,
-                dz: o.vector.z as f32,
-                range: o.range as f32,
-            })
-            .collect();
+        sync_landmarks(self.handle, &mut self.lm_cache, map);
+        let cobs = Self::to_cobs(&valid);
         unsafe {
             pfc_weight(
                 self.handle,
                 cobs.as_ptr(),
                 cobs.len() as c_int,
-                self.cfg.range_noise as f32,
-                self.cfg.bearing_noise as f32,
-                self.cfg.gate_sigma as f32,
+                noise.0,
+                noise.1,
+                noise.2,
             );
         }
     }

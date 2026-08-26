@@ -13,104 +13,13 @@
 
 use std::time::Instant;
 
-use nalgebra::{Unit, UnitQuaternion, Vector3};
+use nalgebra::Vector3;
 
 use pf_core::config::{BackendKind, PfConfig};
-use pf_core::landmark_map::LandmarkMap;
 use pf_core::particle_filter::ParticleFilter;
-use pf_core::types::{Observation, OdomDelta, Pose};
-
-fn test_map(n_lm: i32) -> LandmarkMap {
-    let mut s: u64 = 99;
-    let mut next = move || {
-        s ^= s << 13;
-        s ^= s >> 7;
-        s ^= s << 17;
-        (s % 8000) as f64 / 1000.0 + 1.0
-    };
-    let mut map = LandmarkMap::new();
-    for i in 0..n_lm {
-        map.add(i, Vector3::new(next(), next(), next() * 0.3));
-    }
-    map
-}
-
-/// Deterministic LCG noise (~N(0, 0.5)) matching tests/integration.rs.
-struct Gauss(u64);
-impl Gauss {
-    fn next(&mut self) -> f64 {
-        self.0 ^= self.0 << 13;
-        self.0 ^= self.0 >> 7;
-        self.0 ^= self.0 << 17;
-        let a = (self.0 % 10000) as f64 / 10000.0;
-        self.0 ^= self.0 << 13;
-        self.0 ^= self.0 >> 7;
-        self.0 ^= self.0 << 17;
-        let b = (self.0 % 10000) as f64 / 10000.0;
-        (a + b - 1.0) * 1.732
-    }
-}
-
-struct Scenario {
-    map: LandmarkMap,
-    prior: Pose,
-    steps: Vec<(OdomDelta, Vec<Observation>)>,
-}
-
-fn build_scenario(steps_n: usize, seed: u64) -> Scenario {
-    let mut g = Gauss(seed);
-    let map = test_map(12);
-    let prior = Pose {
-        position: Vector3::new(5.0, 5.0, 0.5),
-        attitude: UnitQuaternion::identity(),
-    };
-
-    let mut truth = prior;
-    let dt = 0.1f64;
-    let mut steps = Vec::with_capacity(steps_n);
-    for t in 0..steps_n {
-        let vel = Vector3::new(
-            -0.4 * (0.2 * t as f64 * dt).sin(),
-            0.4 * (0.2 * t as f64 * dt).cos(),
-            0.02,
-        );
-        let yaw = vel.y.atan2(vel.x);
-        let z_ax = Unit::new_normalize(Vector3::<f64>::z());
-        let att = UnitQuaternion::from_axis_angle(&z_ax, yaw);
-        let new_pos = truth.position + vel * dt;
-
-        let mut odo = OdomDelta {
-            translation: truth.attitude.inverse_transform_vector(&(new_pos - truth.position)),
-            rotation: truth.attitude.inverse() * att,
-            ..Default::default()
-        };
-        odo.translation += Vector3::new(g.next() * 0.05, g.next() * 0.05, g.next() * 0.05);
-
-        truth.position = new_pos;
-        truth.attitude = att;
-
-        let mut obs = Vec::new();
-        for i in 0..12i32 {
-            let body = truth.attitude.inverse_transform_vector(&(map.at(i) - truth.position));
-            let d = body.norm();
-            if d > 5.0 {
-                continue;
-            }
-            let noisy = body * (1.0 + g.next() * 0.05 / d.max(0.1));
-            obs.push(Observation {
-                landmark_id: i,
-                mode: pf_core::types::ObsMode::Cartesian,
-                vector: noisy,
-                range: 0.0,
-            });
-        }
-        steps.push((odo, obs));
-    }
-    Scenario { map, prior, steps }
-}
 
 fn run_backend(kind: BackendKind, n: usize, steps_n: usize, seed: u64) -> (String, f64, f64, usize) {
-    let sc = build_scenario(steps_n, seed);
+    let sc = pf_core::sim::circle_scenario(steps_n, seed);
     let cfg = PfConfig {
         particle_count: n,
         seed: 123,
@@ -118,37 +27,28 @@ fn run_backend(kind: BackendKind, n: usize, steps_n: usize, seed: u64) -> (Strin
         ..Default::default()
     };
     // make_backend may fail if CUDA requested but unavailable
-    let mut pf = match ParticleFilter::new(PfConfig { backend: kind, ..cfg.clone() }) {
+    let mut pf = match ParticleFilter::new(PfConfig { backend: kind, ..cfg }) {
         Ok(p) => p,
         Err(e) => {
             return (format!("unavailable({e})"), f64::NAN, f64::NAN, 0);
         }
     };
     pf.set_map(sc.map);
-    pf.reinitialize(sc.prior, Vector3::new(1.0, 1.0, 1.0), Vector3::new(0.5, 0.5, 0.5));
+    pf.reinitialize(
+        sc.prior,
+        Vector3::new(1.0, 1.0, 1.0),
+        Vector3::new(0.5, 0.5, 0.5),
+    );
 
-    // warmup (allocations, JIT-ish first-touch)
-    let (odo, obs) = &sc.steps[0];
-    let _ = pf.update(odo, obs);
+    // warmup (allocations, first-touch)
+    let step0 = &sc.steps[0];
+    let _ = pf.update(&step0.odom, &step0.obs);
 
     let t0 = Instant::now();
     let mut err_sum = 0.0;
-    // replay truth error using the same trajectory math
-    let mut truth = sc.prior;
-    let dt = 0.1f64;
-    for (t, (odo, obs)) in sc.steps.iter().enumerate() {
-        let vel = Vector3::new(
-            -0.4 * (0.2 * t as f64 * dt).sin(),
-            0.4 * (0.2 * t as f64 * dt).cos(),
-            0.02,
-        );
-        let yaw = vel.y.atan2(vel.x);
-        let z_ax = Unit::new_normalize(Vector3::<f64>::z());
-        truth.attitude = UnitQuaternion::from_axis_angle(&z_ax, yaw);
-        truth.position += vel * dt;
-
-        let est = pf.update(odo, obs);
-        err_sum += (est.mean.position - truth.position).norm();
+    for step in &sc.steps {
+        let est = pf.update(&step.odom, &step.obs);
+        err_sum += (est.mean.position - step.truth.position).norm();
     }
     let per_cycle_ms = t0.elapsed().as_secs_f64() * 1000.0 / steps_n as f64;
     (
@@ -157,34 +57,6 @@ fn run_backend(kind: BackendKind, n: usize, steps_n: usize, seed: u64) -> (Strin
         err_sum / steps_n as f64,
         steps_n,
     )
-}
-
-
-fn gl_test_grid() -> pf_core::global_loc::OccGrid {
-    let (w, h) = (200usize, 200usize);
-    let mut cells = vec![0u8; w * h];
-    for x in 0..w {
-        cells[x] = 1;
-        cells[(h - 1) * w + x] = 1;
-    }
-    for y in 0..h {
-        cells[y * w] = 1;
-        cells[y * w + w - 1] = 1;
-    }
-    let xr = ((4.0 - 0.25) / 0.05) as usize..=((4.0 + 0.25) / 0.05) as usize;
-    let yr = ((5.0 - 0.25) / 0.05) as usize..=((5.0 + 0.25) / 0.05) as usize;
-    for y in yr {
-        for x in xr.clone() {
-            cells[y * w + x] = 1;
-        }
-    }
-    pf_core::global_loc::OccGrid {
-        w,
-        h,
-        res: 0.05,
-        origin: nalgebra::Vector2::new(0.0, 0.0),
-        cells,
-    }
 }
 
 fn main() {
@@ -228,7 +100,7 @@ fn main() {
             "{:>10} {:<8} {:>12} {:>12} {:>10}",
             "hyps", "backend", "ms/localize", "pos err m", "success"
         );
-        let grid = gl_test_grid();
+        let grid = pf_core::sim::room_grid();
         // truth scan
         let truth = (6.0f64, 7.0f64, 0.8f64);
         let scan64 =

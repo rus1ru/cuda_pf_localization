@@ -14,6 +14,7 @@ pub mod config;
 pub mod cpu;
 pub mod landmark_map;
 pub mod particle_filter;
+pub mod sim;
 pub mod types;
 
 #[cfg(feature = "cuda")]

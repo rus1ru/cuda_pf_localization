@@ -35,7 +35,9 @@ src/cuda/pf_kernels.cu   THE CUDA implementation of every pfc_* FFI symbol:
                          with the same nalgebra code path as the CPU backend,
                          so both backends agree by construction.
 crates/pf_core           Rust engine: Backend trait, cpu.rs (rayon),
-                         cuda.rs = pure FFI binding to libpf_kernels.so.
+                         cuda.rs = pure FFI binding to libpf_kernels.so,
+                         sim.rs = deterministic fixtures shared by tests
+                         and the benchmark (frozen draw order!).
 crates/pf_bench          the benchmark binary (this table)
 CMakeLists.txt           builds pf_kernels.cu -> build/libpf_kernels.so
 run_bench.sh             one command: cmake + cargo + benchmark
