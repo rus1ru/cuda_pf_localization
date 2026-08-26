@@ -67,7 +67,7 @@ fn run_kalman_filters(n: usize, sc: &sim::Scenario) -> (f64, f64) {
     let mut err_sum = 0.0f64;
     let t0 = Instant::now();
     for step in &sc.steps {
-        let odo = step.odom.clone();
+        let odo = step.odom;
 
         pf.predict(|state: &[f64], _dt: f64| -> Vec<f64> {
             let mut r = rng.borrow_mut();
@@ -193,11 +193,9 @@ fn main() {
         println!("{0:>8} {1:<30} {2:>12.3} {3:>13.4} m", n, label, ms, err);
 
         #[cfg(feature = "cuda")]
-        if !seq_only {
-            if pf_core::cuda::device_available() {
-                if let Some((name, ms, err)) = run_ours(n, BackendKind::Cuda) {
-                    println!("{0:>8} {1:<30} {2:>12.3} {3:>13.4} m", n, name, ms, err);
-                }
+        if !seq_only && pf_core::cuda::device_available() {
+            if let Some((name, ms, err)) = run_ours(n, BackendKind::Cuda) {
+                println!("{0:>8} {1:<30} {2:>12.3} {3:>13.4} m", n, name, ms, err);
             }
         }
         println!();
