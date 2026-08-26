@@ -15,6 +15,7 @@ thiserror = { workspace = true }
 
 [dev-dependencies]
 approx = "0.5"
+kalman_filters = "1"
 
 [features]
 default = []
