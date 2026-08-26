@@ -98,9 +98,14 @@ Both stages GPU-accelerated, both in Rust.
 
 ## Known gaps
 
-- GPU math is f32 (CPU f64): expect ~1e-3 relative agreement, not bitwise.
+- Particle weights are stored as f32 on both backends: estimate sums are
+  accumulated in double (per-block partials, deterministic order), but the
+  f32 weight storage sets a floor of ~N * 2^-24 on ESS exactness
+  (+0.006 at 100k particles).
 - RNG streams differ by design (curand Philox vs splitmix64) — same noise
   statistics, different draws.
+- Attitude covariance uses the atan2-based canonical axis-angle form on
+  both backends (stable for tightly converged clouds; acos is not).
 - At most 256 observations per `weight()` call are used (silently truncated);
   raise `OBS_CAP` in `pf_core/src/cuda.rs` if your sensor produces more.
 - A ROS 2 wrapper node (rclrs) is planned but not started; the core crate is

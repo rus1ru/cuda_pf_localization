@@ -172,3 +172,48 @@ fn cuda_random_injection_tracks_trajectory() {
         assert!(est.valid && est.ess.is_finite());
     }
 }
+
+
+#[test]
+fn cuda_tight_cloud_accuracy() {
+    // Regression: double-precision estimate accumulation + atan2 angle
+    // extraction. The old f32 atomicAdd path biased ESS by ~4e-6 relative
+    // (100k -> 100000.41) and acos-based angles degraded near w = 1.
+    let Some(mut gpu) = cuda() else {
+        eprintln!("skipping: no CUDA device");
+        return;
+    };
+    let mut cpu = CpuBackend::new();
+    let pose = Pose::default();
+    let pos_std = Vector3::new(0.01, 0.01, 0.01);
+    // tight attitude spread: variances 1e-6 .. 9e-6 rad^2
+    let rot_std = Vector3::new(1e-3, 2e-3, 3e-3);
+    let n = 100_000;
+    let c = cfg(n, 7);
+
+    cpu.init(n, c.clone());
+    cpu.reinit(&pose, &pos_std, &rot_std);
+    gpu.init(n, c);
+    gpu.reinit(&pose, &pos_std, &rot_std);
+
+    let ec = cpu.estimate();
+    let eg = gpu.estimate();
+
+    // ESS on a uniform-weight cloud. The residual floor (~N * f32::EPS,
+    // i.e. +-0.012 at 100k) comes from weights being STORED as f32;
+    // the old f32 atomicAdd path biased this by +0.41.
+    assert!(
+        (eg.ess - n as f64).abs() < 0.05,
+        "GPU ESS drifted from N: {}",
+        eg.ess
+    );
+
+    for i in 0..3 {
+        let want = rot_std[i] * rot_std[i];
+        assert_abs_diff_eq!(ec.att_cov[i][i], want, epsilon = 0.05 * want);
+        // GPU must track the f64 CPU reference closely at this spread
+        let rel = ((eg.att_cov[i][i] - ec.att_cov[i][i]) / want).abs();
+        assert!(rel < 0.02, "att_cov[{i}] CPU/GPU mismatch: {} vs {}",
+            ec.att_cov[i][i], eg.att_cov[i][i]);
+    }
+}

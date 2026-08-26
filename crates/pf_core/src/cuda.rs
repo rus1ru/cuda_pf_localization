@@ -28,11 +28,7 @@ struct CObservation {
 
 /// Output of the covariance pass: packed upper triangles
 /// [Pxx,Pxy,Pxz,Pyy,Pyz,Pzz | Axx,Axy,Axz,Ayy,Ayz,Azz].
-#[repr(C)]
-#[derive(Debug, Clone, Copy, Default)]
-struct CCovs {
-    v: [f32; 12],
-}
+type CCovs = [f64; 12];
 
 extern "C" {
     fn pfc_create(cap_obs: c_int) -> *mut core::ffi::c_void;
@@ -71,7 +67,7 @@ extern "C" {
         gate: f32,
     ) -> c_int;
     fn pfc_resample(h: *mut core::ffi::c_void, random_inject_ratio: f32) -> c_int;
-    fn pfc_est_sums(h: *mut core::ffi::c_void, out: *mut f32) -> c_int;
+    fn pfc_est_sums(h: *mut core::ffi::c_void, out: *mut f64) -> c_int;
     fn pfc_covs(
         h: *mut core::ffi::c_void,
         mx: f32,
@@ -269,8 +265,8 @@ impl Backend for CudaBackend {
         if self.n == 0 {
             return Estimate::default();
         }
-        // Pass 1: weighted sums from the device.
-        let mut sums = [0.0f32; 14];
+        // Pass 1: weighted sums from the device (double accumulation).
+        let mut sums = [0.0f64; 14];
         unsafe {
             let rc = pfc_est_sums(self.handle, sums.as_mut_ptr());
             assert_eq!(rc, 0, "pfc_est_sums failed");
@@ -282,22 +278,22 @@ impl Backend for CudaBackend {
         for r in 0..4usize {
             for c in r..4usize {
                 let off = 4 * r - r * (r - 1) / 2 + (c - r);
-                let v = sums[3 + off] as f64;
-                m[(r, c)] = v;
-                m[(c, r)] = v;
+                m[(r, c)] = sums[3 + off];
+                m[(c, r)] = sums[3 + off];
             }
         }
         let mean_att = quat_mean(&m);
         let q = mean_att.quaternion();
 
         // Pass 2: covariances around the means.
-        let mut cv = CCovs::default();
+        let mut cv: CCovs = [0.0; 12];
         unsafe {
+            // mean position is passed back at f32 kernel precision
             let rc = pfc_covs(
                 self.handle,
-                sums[0],
-                sums[1],
-                sums[2],
+                sums[0] as f32,
+                sums[1] as f32,
+                sums[2] as f32,
                 q.w as f32,
                 q.i as f32,
                 q.j as f32,
@@ -307,12 +303,12 @@ impl Backend for CudaBackend {
             assert_eq!(rc, 0, "pfc_covs failed");
         }
         // unpack a symmetric 3x3 from a packed upper triangle at offset o
-        let sym3 = |v: &[f32; 12], o: usize| -> [[f64; 3]; 3] {
+        let sym3 = |v: &CCovs, o: usize| -> [[f64; 3]; 3] {
             let mut m = [[0.0f64; 3]; 3];
             let at = |r: usize, c: usize| o + 3 * r - r * (r - 1) / 2 + (c - r);
             for r in 0..3usize {
                 for c in r..3usize {
-                    let x = v[at(r, c)] as f64;
+                    let x = v[at(r, c)];
                     m[r][c] = x;
                     m[c][r] = x;
                 }
@@ -322,12 +318,12 @@ impl Backend for CudaBackend {
 
         Estimate {
             mean: Pose {
-                position: Vector3::new(sums[0] as f64, sums[1] as f64, sums[2] as f64),
+                position: Vector3::new(sums[0], sums[1], sums[2]),
                 attitude: mean_att,
             },
-            pos_cov: sym3(&cv.v, 0),
-            att_cov: sym3(&cv.v, 6),
-            ess: if sums[13] > 0.0 { 1.0 / sums[13] as f64 } else { 0.0 },
+            pos_cov: sym3(&cv, 0),
+            att_cov: sym3(&cv, 6),
+            ess: if sums[13] > 0.0 { 1.0 / sums[13] } else { 0.0 },
             valid: true,
         }
     }

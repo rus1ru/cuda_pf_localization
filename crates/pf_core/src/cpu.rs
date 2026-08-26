@@ -1,6 +1,5 @@
 //! Rayon-parallel CPU backend.
 
-use std::f64::consts::PI;
 
 use nalgebra::{Matrix4, Quaternion, Unit, UnitQuaternion, Vector3};
 use rand::prelude::*;
@@ -331,16 +330,21 @@ impl Backend for CpuBackend {
                     pos_cov[r][c] += w * dp[r] * dp[c];
                 }
             }
+            // canonical sign (w >= 0), then angle = 2*atan2(|qv|, |w|):
+            // numerically stable for both tiny and near-pi rotations
+            // (acos loses all precision near w = +-1).
             let dq = mean_att.inverse() * self.att[i];
             let q = dq.quaternion();
-            let (sign, ang) = if q.w >= 0.0 {
-                (1.0, 2.0 * q.w.acos().min(PI))
+            // NOTE: not named `w` — that would shadow the particle weight
+            let (qw_, qi_, qj_, qk_) = if q.w >= 0.0 {
+                (q.w, q.i, q.j, q.k)
             } else {
-                (-1.0, 2.0 * (-q.w).acos().min(PI))
+                (-q.w, -q.i, -q.j, -q.k)
             };
-            let axis = Vector3::new(sign * q.i, sign * q.j, sign * q.k);
-            let aav = if axis.norm() > 1e-9 {
-                axis.normalize() * ang
+            let hv = (qi_ * qi_ + qj_ * qj_ + qk_ * qk_).sqrt();
+            let ang = 2.0 * hv.atan2(qw_);
+            let aav = if hv > 1e-12 {
+                Vector3::new(qi_ * ang / hv, qj_ * ang / hv, qk_ * ang / hv)
             } else {
                 Vector3::zeros()
             };

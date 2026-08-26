@@ -70,6 +70,7 @@ namespace {
 
 constexpr int EST_N = 14;  // 3 mean-pos + 10 M-entries + 1 sum-w2
 constexpr int COV_N = 12;  // 6 pos-cov + 6 att-cov upper-triangle entries
+constexpr int MAX_BLOCKS = 1024;
 
 struct alignas(16) QuatF {
     float w, x, y, z;
@@ -99,7 +100,8 @@ struct PfState {
 
     int*   d_max = nullptr;       // ordered-float atomicMax target
     float* d_sumexp = nullptr;    // atomicAdd accumulator
-    float* d_est = nullptr;       // EST_N estimate partials
+    double* d_est = nullptr;      // EST_N per-block partials (double)
+    double* d_est_out = nullptr;  // EST_N summed results
 
     float* d_lm = nullptr;        // 3*lm_cap, dense by id
     int    lm_cap = 0;
@@ -108,7 +110,8 @@ struct PfState {
     int    obs_cap = 0;
 
     curandStatePhilox4_32_10_t* d_rng = nullptr;
-    float* d_cov = nullptr;       // COV_N covariance partials
+    double* d_cov = nullptr;      // COV_N per-block partials (double)
+    double* d_cov_out = nullptr;  // COV_N summed results
 
     unsigned long long lcg = 0x243F6A8885A308D3ull;  // resample u0 stream
 };
@@ -352,9 +355,14 @@ __global__ void k_inject(float* pos, int n, int k, unsigned long long lcg,
 // (upper triangle of sum w q q^T), and sum w^2.
 // est layout: [0..2] = sum w*p ; [3..12] = M00,M01,M02,M03,M11,M12,M13,M22,M23,M33
 //             [13] = sum w^2
+// Precision strategy: per-thread and warp reductions run in float (consumer
+// GPUs execute FP64 at 1/64 rate), but each block combines its <=8 warp
+// totals in double. The old design accumulated thousands of f32 atomicAdds
+// into one slot; here every value crosses at most ~5 float rounding steps
+// before hitting double, so accuracy approaches full-double at FP32 speed.
 __global__ void k_est_sums(const float* pos, const QuatF* att, const float* w,
-                           int n, float* est) {
-    __shared__ float sh[EST_N][33];
+                           int n, double* blocks_out) {
+    __shared__ double sh[EST_N][33];
     int tid = threadIdx.x;
     int lane = tid & 31, warp = tid >> 5;
     float acc[EST_N];
@@ -384,14 +392,14 @@ __global__ void k_est_sums(const float* pos, const QuatF* att, const float* w,
     for (int k = 0; k < EST_N; ++k) {
         for (int off = 16; off > 0; off >>= 1)
             acc[k] += __shfl_down_sync(0xffffffffu, acc[k], off);
-        if (lane == 0) sh[k][warp] = acc[k];
+        if (lane == 0) sh[k][warp] = static_cast<double>(acc[k]);
     }
     __syncthreads();
     int nwarp = (blockDim.x + 31) / 32;
     if (tid < EST_N) {
-        float v = 0.f;
+        double v = 0.0;
         for (int k = 0; k < nwarp; ++k) v += sh[tid][k];
-        atomicAdd(&est[tid], v);
+        blocks_out[blockIdx.x * EST_N + tid] = v;
     }
 }
 
@@ -399,9 +407,10 @@ __global__ void k_est_sums(const float* pos, const QuatF* att, const float* w,
 // attitude tangent-space covariance around given means.
 // cov layout: [0..5]   = Pxx,Pxy,Pxz,Pyy,Pyz,Pzz
 //             [6..11]  = Axx,Axy,Axz,Ayy,Ayz,Azz
+// Same hybrid precision strategy as k_est_sums.
 __global__ void k_est_covs(const float* pos, const QuatF* att, const float* w,
-                           int n, float3 mean_p, QuatF qm, float* cov) {
-    __shared__ float sh[COV_N][33];
+                           int n, float3 mean_p, QuatF qm, double* blocks_out) {
+    __shared__ double sh[COV_N][33];
     int tid = threadIdx.x;
     int lane = tid & 31, warp = tid >> 5;
     float acc[COV_N];
@@ -423,19 +432,18 @@ __global__ void k_est_covs(const float* pos, const QuatF* att, const float* w,
                 ++e;
             }
         }
-        // attitude residual dq = qm^-1 * qi as signed axis-angle
+        // Attitude residual dq = qm^-1 * qi as axis-angle. Canonical sign
+        // (w >= 0), then angle = 2*atan2(|qv|, |w|): no acos precision cliff
+        // near w = 1 (tightly converged clouds) nor near -1.
         QuatF dq = q_mul(q_conj(qm), att[i]);
-        float sgn = dq.w >= 0.f ? 1.f : -1.f;
-        float cw = fminf(fabsf(dq.w), 1.f);
-        float ang = 2.f * acosf(cw);
-        float axn[3] = {sgn * dq.x, sgn * dq.y, sgn * dq.z};
-        float an = sqrtf(axn[0] * axn[0] + axn[1] * axn[1] +
-                         axn[2] * axn[2]);
+        if (dq.w < 0.f) dq = QuatF{-dq.w, -dq.x, -dq.y, -dq.z};
+        float hv = sqrtf(dq.x * dq.x + dq.y * dq.y + dq.z * dq.z);
+        float ang = 2.f * atan2f(hv, dq.w);
         float aav[3] = {0.f, 0.f, 0.f};
-        if (an > 1e-9f) {
-            aav[0] = axn[0] / an * ang;
-            aav[1] = axn[1] / an * ang;
-            aav[2] = axn[2] / an * ang;
+        if (hv > 1e-12f) {
+            aav[0] = dq.x / hv * ang;
+            aav[1] = dq.y / hv * ang;
+            aav[2] = dq.z / hv * ang;
         }
         e = 6;
 #pragma unroll
@@ -451,14 +459,14 @@ __global__ void k_est_covs(const float* pos, const QuatF* att, const float* w,
     for (int k = 0; k < COV_N; ++k) {
         for (int off = 16; off > 0; off >>= 1)
             acc[k] += __shfl_down_sync(0xffffffffu, acc[k], off);
-        if (lane == 0) sh[k][warp] = acc[k];
+        if (lane == 0) sh[k][warp] = static_cast<double>(acc[k]);
     }
     __syncthreads();
     int nwarp = (blockDim.x + 31) / 32;
     if (tid < COV_N) {
-        float v = 0.f;
+        double v = 0.0;
         for (int k = 0; k < nwarp; ++k) v += sh[tid][k];
-        atomicAdd(&cov[tid], v);
+        blocks_out[blockIdx.x * COV_N + tid] = v;
     }
 }
 
@@ -481,8 +489,12 @@ void* pfc_create(int cap_obs) {
     s->obs_cap = cap_obs;
     CK_ALLOC(cudaMalloc((void**)&s->d_max, sizeof(int)));
     CK_ALLOC(cudaMalloc((void**)&s->d_sumexp, sizeof(float)));
-    CK_ALLOC(cudaMalloc((void**)&s->d_est, EST_N * sizeof(float)));
-    CK_ALLOC(cudaMalloc((void**)&s->d_cov, COV_N * sizeof(float)));
+    CK_ALLOC(cudaMalloc((void**)&s->d_est,
+                        (size_t)MAX_BLOCKS * EST_N * sizeof(double)));
+    CK_ALLOC(cudaMalloc((void**)&s->d_cov,
+                        (size_t)MAX_BLOCKS * COV_N * sizeof(double)));
+    CK_ALLOC(cudaMalloc((void**)&s->d_est_out, EST_N * sizeof(double)));
+    CK_ALLOC(cudaMalloc((void**)&s->d_cov_out, COV_N * sizeof(double)));
     CK_ALLOC(cudaMalloc((void**)&s->d_obs, cap_obs * sizeof(ObsF)));
     return reinterpret_cast<void*>(s);
 fail:
@@ -499,6 +511,7 @@ int pfc_destroy(void* h) {
     cudaFree(s->d_lm); cudaFree(s->d_obs);
     cudaFree(s->d_rng); cudaFree(s->d_max); cudaFree(s->d_sumexp);
     cudaFree(s->d_est); cudaFree(s->d_cov);
+    cudaFree(s->d_est_out); cudaFree(s->d_cov_out);
     delete s;
     return 0;
 }
@@ -662,19 +675,31 @@ int pfc_resample(void* h, float random_inject_ratio) {
     return 0;
 }
 
+// Final fixed-order reduction of the per-block partials on device: one
+// block, sequential loop over blocks — deterministic, and only k_n doubles
+// are read back by the host.
+__global__ void k_sum_blocks(const double* parts, int blocks, int k_n,
+                             double* out) {
+    for (int t = threadIdx.x; t < k_n; t += blockDim.x) {
+        double v = 0.0;
+        for (int b = 0; b < blocks; ++b)
+            v += parts[(size_t)b * k_n + t];
+        out[t] = v;
+    }
+}
+
 // Pass 1: weighted sums — [0..2] mean position, [3..12] packed upper
-// triangle of the quaternion moment matrix, [13] sum w^2. The Markley
-// quaternion mean is solved on the HOST (identical nalgebra path as the
-// CPU backend); pass the solved mean back via pfc_covs.
-int pfc_est_sums(void* h, float* out) {
+// triangle of the quaternion moment matrix, [13] sum w^2. Accumulation in
+// double throughout; the Markley quaternion mean is solved on the HOST
+// (identical nalgebra path as the CPU backend).
+int pfc_est_sums(void* h, double* out) {
     auto* s = static_cast<PfState*>(h);
     if (!s || s->n <= 0 || !out) return -1;
-    float zero[EST_N] = {0.f};
-    CK(cudaMemcpy(s->d_est, zero, sizeof(zero), cudaMemcpyHostToDevice));
-    int blocks = std::min(1024, (s->n + 255) / 256);
+    int blocks = std::min(MAX_BLOCKS, (s->n + 255) / 256);
     KL((k_est_sums<<<blocks, 256>>>(s->d_pos, s->d_att, s->d_w, s->n,
                                    s->d_est)));
-    CK(cudaMemcpy(out, s->d_est, EST_N * sizeof(float),
+    KL((k_sum_blocks<<<1, 64>>>(s->d_est, blocks, EST_N, s->d_est_out)));
+    CK(cudaMemcpy(out, s->d_est_out, EST_N * sizeof(double),
                   cudaMemcpyDeviceToHost));
     return 0;
 }
@@ -682,17 +707,16 @@ int pfc_est_sums(void* h, float* out) {
 // Pass 2: weighted position + attitude-tangent covariance packed
 // upper triangles around the given means.
 int pfc_covs(void* h, float mx, float my, float mz, float qw, float qx,
-             float qy, float qz, float* out) {
+             float qy, float qz, double* out) {
     auto* s = static_cast<PfState*>(h);
     if (!s || s->n <= 0 || !out) return -1;
-    float zero[COV_N] = {0.f};
-    CK(cudaMemcpy(s->d_cov, zero, sizeof(zero), cudaMemcpyHostToDevice));
-    int blocks = std::min(1024, (s->n + 255) / 256);
+    int blocks = std::min(MAX_BLOCKS, (s->n + 255) / 256);
     float3 mp = make_float3(mx, my, mz);
     QuatF qm{qw, qx, qy, qz};
     KL((k_est_covs<<<blocks, 256>>>(s->d_pos, s->d_att, s->d_w, s->n, mp, qm,
                                     s->d_cov)));
-    CK(cudaMemcpy(out, s->d_cov, COV_N * sizeof(float),
+    KL((k_sum_blocks<<<1, 64>>>(s->d_cov, blocks, COV_N, s->d_cov_out)));
+    CK(cudaMemcpy(out, s->d_cov_out, COV_N * sizeof(double),
                   cudaMemcpyDeviceToHost));
     return 0;
 }
